@@ -1,5 +1,7 @@
 /**
+
  * dashboard-widget.js
+ 
  **/
 (function () {
   'use strict';
