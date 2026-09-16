@@ -1,7 +1,5 @@
 /**
-
  * dashboard-widget.js
- 
  **/
 (function () {
   'use strict';
@@ -20,7 +18,13 @@
     { month: 'Mar', revenue: 13500, users: 380 },
     { month: 'Apr', revenue: 18200, users: 460 },
     { month: 'May', revenue: 20100, users: 510 },
-    { month: 'Jun', revenue: 22400, users: 590 }
+    { month: 'Jun', revenue: 22400, users: 590 },
+    { month: 'Jul', revenue: 24800, users: 640 },
+    { month: 'Aug', revenue: 23100, users: 610 },
+    { month: 'Sep', revenue: 26500, users: 670 },
+    { month: 'Oct', revenue: 28900, users: 720 },
+    { month: 'Nov', revenue: 31200, users: 760 },
+    { month: 'Dec', revenue: 34500, users: 810 }
   ];
 
   function formatCurrency(v) { return '$' + v.toLocaleString('en-US'); }
