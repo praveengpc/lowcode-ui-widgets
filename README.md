@@ -56,12 +56,3 @@ To get consistent results, use one of these prompts:
 
 After Claude gives you the file, follow the "Updating a widget and releasing
 a new version" steps above to actually publish it.
-
-## Versioning
-
-Each release is tagged using semver (`v1.0.0`, `v2.0.0`, ...). Point
-production usage at `@latest` for zero-touch updates once a release is
-published, or pin to a specific tag (`@v1.0.0`) if you want changes to
-require a deliberate version bump before they go live. Avoid pointing
-production at `@main` — its cache is short and unpredictable, and it isn't
-a stable release point.
