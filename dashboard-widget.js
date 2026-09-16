@@ -1,18 +1,6 @@
 /**
  * dashboard-widget.js
- *
- * Same shape as frontendtips-menu.js / simple-spa-menu.js: a single JS file
- * that registers one custom element, <dashboard-widget>, with its own
- * Shadow DOM. Load this file (e.g. via OutSystems Extra Scripts, or a CDN
- * URL pointed at this file in your GitHub repo), then drop
- * <dashboard-widget></dashboard-widget> into an HTML widget wherever the
- * dashboard should appear. No page wrapper, no id lookups on the host page.
- *
- * The tag name 'dashboard-widget' is part of the contract with whatever
- * OutSystems screen already has it typed into an HTML widget — keep this
- * name the same across future versions of this file, since the screen
- * that uses it isn't republished when this script changes.
- */
+ **/
 (function () {
   'use strict';
 
