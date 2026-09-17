@@ -1,288 +1,451 @@
 /**
  * dashboard-widget.js
- *
- * Web Component conversion of the original mount()/unmount() task-list POC
- * script. Built the same way as frontendtips-menu.js / simple-spa-menu.js:
- * a real custom element with its own Shadow DOM, registered once via
- * customElements.define(). No getElementById lookups, no hardcoded
- * container id anywhere in this file.
- *
- * Tag name: kept as "dashboard-widget" — the same tag already used by the
- * OutSystems screen — rather than introducing a new one, since that screen
- * is not republished when this script changes.
- *
- * Why this matters for OutSystems: the original script needed a container
- * id (mount("someId", ...)) and a JS function reference (options.onComplete)
- * handed to it at mount time. Neither survives OutSystems' runtime DOM
- * generation cleanly — ids and JS references aren't things Service Studio
- * can wire up. A custom element fixes both:
- *   - No id needed: connectedCallback() fires the moment <dashboard-widget>
- *     appears anywhere in the DOM, regardless of what id OutSystems
- *     generated around it.
- *   - No function reference needed: instead of an onComplete callback,
- *     completing a task fires a normal CustomEvent ("os-task-complete")
- *     that bubbles and crosses the Shadow DOM boundary (composed: true),
- *     so OutSystems can just addEventListener() from an Extra Script /
- *     OnReady handler and call a client action from there.
- *
- * Usage in OutSystems:
- *   1. Upload this file as a resource and add it to the module's (or
- *      Theme's) Extra Scripts, so customElements.define() runs once when
- *      the app loads.
- *   2. On any screen, drop an HTML widget and put this inside it:
- *        <dashboard-widget heading="Operations dashboard"></dashboard-widget>
- *      The "heading" attribute is optional (defaults to "Operations
- *      dashboard").
- *   3. To react to task completion, attach a listener once, e.g. in an
- *      Extra Script or a small inline <script>:
- *
- *        document.addEventListener('os-task-complete', function (e) {
- *          // e.detail.id, e.detail.title
- *          // call your OutSystems client action here
- *        });
- *
- *      (The event bubbles up to document, so one listener covers every
- *      <dashboard-widget> instance on the page.)
- *
- * IMPORTANT: keep the tag name "dashboard-widget" the same across future
- * versions of this file — the screen referencing it isn't republished when
- * this script changes. Also note: if another script on the same page
- * already registers "dashboard-widget" for a different component (e.g. an
- * earlier chart-based version), only the one that loads first will win —
- * make sure this file is the one actually referenced in Extra Scripts.
- */
+ **/
 (function () {
   'use strict';
 
-  var initialTasks = [
-    { id: 1, title: 'Review warehouse layout', owner: 'Alex', status: 'Open' },
-    { id: 2, title: 'Approve maintenance request', owner: 'Sam', status: 'Open' },
-    { id: 3, title: 'Confirm delivery schedule', owner: 'Jordan', status: 'Completed' }
+  var SVG_NS = 'http://www.w3.org/2000/svg';
+  var WIDTH = 480;
+  var HEIGHT = 260;
+  var PAD_LEFT = 52;
+  var PAD_TOP = 28;
+  var PAD_BOTTOM = 32;
+
+  // ---- Sample dataset, shared by both charts and the table ----
+  var dashboardData = [
+    { month: 'Jan', revenue: 12000, users: 320 },
+    { month: 'Feb', revenue: 15000, users: 410 },
+    { month: 'Mar', revenue: 13500, users: 380 },
+    { month: 'Apr', revenue: 18200, users: 460 },
+    { month: 'May', revenue: 20100, users: 510 },
+    { month: 'Jun', revenue: 22400, users: 590 },
+    { month: 'Jul', revenue: 24800, users: 640 },
+    { month: 'Aug', revenue: 23100, users: 610 },
+    { month: 'Sep', revenue: 26500, users: 670 },
+    { month: 'Oct', revenue: 28900, users: 720 },
+    { month: 'Nov', revenue: 31200, users: 760 },
+    { month: 'Dec', revenue: 34500, users: 810 }
   ];
 
-  function escapeHtml(str) {
-    return String(str).replace(/[&<>"']/g, function (c) {
-      return { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c];
+  function formatCurrency(v) { return '$' + v.toLocaleString('en-US'); }
+  function formatNumber(v) { return v.toLocaleString('en-US'); }
+
+  function niceScale(maxValue, tickCount) {
+    tickCount = tickCount || 4;
+    if (maxValue <= 0) return { niceMax: 1, ticks: [0, 1] };
+
+    var rawStep = maxValue / tickCount;
+    var magnitude = Math.pow(10, Math.floor(Math.log10(rawStep)));
+    var normalized = rawStep / magnitude;
+
+    var niceStep;
+    if (normalized <= 1) niceStep = 1 * magnitude;
+    else if (normalized <= 2) niceStep = 2 * magnitude;
+    else if (normalized <= 5) niceStep = 5 * magnitude;
+    else niceStep = 10 * magnitude;
+
+    var niceMax = Math.ceil(maxValue / niceStep) * niceStep;
+    var ticks = [];
+    for (var t = 0; t <= niceMax; t += niceStep) ticks.push(Math.round(t));
+
+    return { niceMax: niceMax, ticks: ticks };
+  }
+
+  function svgEl(tag, attrs) {
+    var e = document.createElementNS(SVG_NS, tag);
+    for (var key in attrs) {
+      if (Object.prototype.hasOwnProperty.call(attrs, key)) {
+        e.setAttribute(key, attrs[key]);
+      }
+    }
+    return e;
+  }
+
+  // Top corners rounded, bottom square — bars grow from a single baseline.
+  function topRoundedRectPath(x, y, width, height, radius) {
+    var r = Math.max(0, Math.min(radius, width / 2, height));
+    var yBottom = y + height;
+    return (
+      'M' + x + ',' + (y + r) +
+      ' Q' + x + ',' + y + ' ' + (x + r) + ',' + y +
+      ' L' + (x + width - r) + ',' + y +
+      ' Q' + (x + width) + ',' + y + ' ' + (x + width) + ',' + (y + r) +
+      ' L' + (x + width) + ',' + yBottom +
+      ' L' + x + ',' + yBottom +
+      ' Z'
+    );
+  }
+
+  function renderTooltip(tooltip, xPercent, yPercent, value, month, color) {
+    tooltip.innerHTML = '';
+    var valueEl = document.createElement('div');
+    valueEl.className = 'tooltip-value';
+    valueEl.textContent = value;
+    var labelEl = document.createElement('div');
+    labelEl.className = 'tooltip-label';
+    var swatch = document.createElement('span');
+    swatch.className = 'tooltip-swatch';
+    swatch.style.backgroundColor = color;
+    labelEl.appendChild(swatch);
+    labelEl.appendChild(document.createTextNode(month));
+    tooltip.appendChild(valueEl);
+    tooltip.appendChild(labelEl);
+    tooltip.style.left = xPercent + '%';
+    tooltip.style.top = yPercent + '%';
+    tooltip.hidden = false;
+  }
+
+  // ---- Each render* function only ever touches the container element
+  // it's handed — no document.getElementById, no global ids — so they
+  // work the same whether that container lives in the light DOM or, as
+  // here, inside a component's Shadow DOM. ----
+
+  function renderBarChart(container, opts) {
+    var data = opts.data, valueKey = opts.valueKey, color = opts.color, formatValue = opts.formatValue;
+    var PAD_RIGHT = 16;
+    var plotW = WIDTH - PAD_LEFT - PAD_RIGHT;
+    var plotH = HEIGHT - PAD_TOP - PAD_BOTTOM;
+
+    var values = data.map(function (d) { return d[valueKey]; });
+    var maxValue = Math.max.apply(null, values);
+    var scale = niceScale(maxValue, 4);
+    var niceMax = scale.niceMax, ticks = scale.ticks;
+
+    var slotWidth = plotW / data.length;
+    var barWidth = Math.min(24, slotWidth * 0.5);
+    var maxIndex = values.indexOf(maxValue);
+
+    function yFor(value) { return PAD_TOP + plotH - (value / niceMax) * plotH; }
+
+    container.innerHTML =
+      '<h3 class="chart-title">' + opts.title + '</h3>' +
+      '<div class="chart-wrap">' +
+      '<svg viewBox="0 0 ' + WIDTH + ' ' + HEIGHT + '" class="chart-svg" role="img" aria-label="' + opts.title + '"></svg>' +
+      '<div class="chart-tooltip" hidden></div>' +
+      '</div>';
+
+    var svg = container.querySelector('svg');
+    var tooltip = container.querySelector('.chart-tooltip');
+
+    ticks.forEach(function (tick) {
+      var y = yFor(tick);
+      svg.appendChild(svgEl('line', { x1: PAD_LEFT, x2: WIDTH - PAD_RIGHT, y1: y, y2: y, class: 'gridline' }));
+      var text = svgEl('text', { x: PAD_LEFT - 8, y: y, class: 'tick-label', 'text-anchor': 'end', 'dominant-baseline': 'middle' });
+      text.textContent = tick.toLocaleString('en-US');
+      svg.appendChild(text);
+    });
+
+    svg.appendChild(svgEl('line', {
+      x1: PAD_LEFT, x2: WIDTH - PAD_RIGHT,
+      y1: PAD_TOP + plotH, y2: PAD_TOP + plotH, class: 'baseline'
+    }));
+
+    data.forEach(function (d, i) {
+      var value = d[valueKey];
+      var barHeight = (value / niceMax) * plotH;
+      var xCenter = PAD_LEFT + slotWidth * (i + 0.5);
+      var x = xCenter - barWidth / 2;
+      var y = PAD_TOP + plotH - barHeight;
+
+      var path = svgEl('path', {
+        d: topRoundedRectPath(x, y, barWidth, barHeight, 4),
+        fill: color,
+        opacity: '0.92',
+        tabindex: '0',
+        role: 'img',
+        'aria-label': d.month + ': ' + formatValue(value),
+        class: 'hit-target'
+      });
+      path.style.transition = 'filter 0.15s, opacity 0.15s';
+
+      function show() {
+        path.style.filter = 'brightness(1.1)';
+        path.setAttribute('opacity', '1');
+        renderTooltip(tooltip, (xCenter / WIDTH) * 100, (y / HEIGHT) * 100, formatValue(value), d.month, color);
+      }
+      function hide() {
+        path.style.filter = 'none';
+        path.setAttribute('opacity', '0.92');
+        tooltip.hidden = true;
+      }
+
+      path.addEventListener('mouseenter', show);
+      path.addEventListener('mouseleave', hide);
+      path.addEventListener('focus', show);
+      path.addEventListener('blur', hide);
+
+      svg.appendChild(path);
+
+      if (i === maxIndex) {
+        var label = svgEl('text', { x: xCenter, y: y - 8, 'text-anchor': 'middle', class: 'data-label' });
+        label.textContent = formatValue(value);
+        svg.appendChild(label);
+      }
+
+      var monthLabel = svgEl('text', { x: xCenter, y: HEIGHT - 10, 'text-anchor': 'middle', class: 'axis-label' });
+      monthLabel.textContent = d.month;
+      svg.appendChild(monthLabel);
     });
   }
 
+  function renderLineChart(container, opts) {
+    var data = opts.data, valueKey = opts.valueKey, color = opts.color, formatValue = opts.formatValue;
+    var PAD_RIGHT = 40;
+    var plotW = WIDTH - PAD_LEFT - PAD_RIGHT;
+    var plotH = HEIGHT - PAD_TOP - PAD_BOTTOM;
+
+    var values = data.map(function (d) { return d[valueKey]; });
+    var maxValue = Math.max.apply(null, values);
+    var scale = niceScale(maxValue, 4);
+    var niceMax = scale.niceMax, ticks = scale.ticks;
+
+    var slotWidth = plotW / data.length;
+    function xFor(i) { return PAD_LEFT + slotWidth * (i + 0.5); }
+    function yFor(value) { return PAD_TOP + plotH - (value / niceMax) * plotH; }
+
+    var points = data.map(function (d, i) { return { x: xFor(i), y: yFor(d[valueKey]) }; });
+    var linePath = points.map(function (p, i) { return (i === 0 ? 'M' : 'L') + p.x + ',' + p.y; }).join(' ');
+    var lastIndex = data.length - 1;
+
+    container.innerHTML =
+      '<h3 class="chart-title">' + opts.title + '</h3>' +
+      '<div class="chart-wrap">' +
+      '<svg viewBox="0 0 ' + WIDTH + ' ' + HEIGHT + '" class="chart-svg" role="img" aria-label="' + opts.title + '"></svg>' +
+      '<div class="chart-tooltip" hidden></div>' +
+      '</div>';
+
+    var svg = container.querySelector('svg');
+    var tooltip = container.querySelector('.chart-tooltip');
+
+    ticks.forEach(function (tick) {
+      var y = yFor(tick);
+      svg.appendChild(svgEl('line', { x1: PAD_LEFT, x2: WIDTH - PAD_RIGHT, y1: y, y2: y, class: 'gridline' }));
+      var text = svgEl('text', { x: PAD_LEFT - 8, y: y, class: 'tick-label', 'text-anchor': 'end', 'dominant-baseline': 'middle' });
+      text.textContent = tick.toLocaleString('en-US');
+      svg.appendChild(text);
+    });
+
+    svg.appendChild(svgEl('line', {
+      x1: PAD_LEFT, x2: WIDTH - PAD_RIGHT,
+      y1: PAD_TOP + plotH, y2: PAD_TOP + plotH, class: 'baseline'
+    }));
+
+    data.forEach(function (d, i) {
+      var monthLabel = svgEl('text', { x: xFor(i), y: HEIGHT - 10, 'text-anchor': 'middle', class: 'axis-label' });
+      monthLabel.textContent = d.month;
+      svg.appendChild(monthLabel);
+    });
+
+    svg.appendChild(svgEl('path', {
+      d: linePath, fill: 'none', stroke: color, 'stroke-width': '2',
+      'stroke-linejoin': 'round', 'stroke-linecap': 'round'
+    }));
+
+    var crosshair = svgEl('line', {
+      x1: 0, x2: 0, y1: PAD_TOP, y2: PAD_TOP + plotH, class: 'crosshair'
+    });
+    crosshair.style.display = 'none';
+    svg.appendChild(crosshair);
+
+    points.forEach(function (p, i) {
+      var circle = svgEl('circle', {
+        cx: p.x, cy: p.y, r: 4, fill: color,
+        stroke: 'var(--surface-1)', 'stroke-width': '2',
+        tabindex: '0', role: 'img',
+        'aria-label': data[i].month + ': ' + formatValue(data[i][valueKey]),
+        class: 'hit-target'
+      });
+      circle.addEventListener('focus', function () { setHover(i); });
+      circle.addEventListener('blur', function () { clearHover(); });
+      svg.appendChild(circle);
+    });
+
+    var endLabel = svgEl('text', {
+      x: points[lastIndex].x + 8, y: points[lastIndex].y - 8,
+      class: 'data-label', 'text-anchor': 'start'
+    });
+    endLabel.textContent = formatValue(data[lastIndex][valueKey]);
+    svg.appendChild(endLabel);
+
+    var overlay = svgEl('rect', {
+      x: PAD_LEFT, y: PAD_TOP, width: plotW, height: plotH, fill: 'transparent'
+    });
+    svg.appendChild(overlay);
+
+    function setHover(index) {
+      var p = points[index];
+      crosshair.setAttribute('x1', p.x);
+      crosshair.setAttribute('x2', p.x);
+      crosshair.style.display = 'block';
+      renderTooltip(tooltip, (p.x / WIDTH) * 100, (p.y / HEIGHT) * 100, formatValue(data[index][valueKey]), data[index].month, color);
+    }
+    function clearHover() {
+      crosshair.style.display = 'none';
+      tooltip.hidden = true;
+    }
+
+    overlay.addEventListener('mousemove', function (e) {
+      var rect = svg.getBoundingClientRect();
+      var relativeX = ((e.clientX - rect.left) / rect.width) * WIDTH;
+      var nearest = 0, nearestDist = Infinity;
+      points.forEach(function (p, i) {
+        var dist = Math.abs(p.x - relativeX);
+        if (dist < nearestDist) { nearestDist = dist; nearest = i; }
+      });
+      setHover(nearest);
+    });
+    overlay.addEventListener('mouseleave', clearHover);
+  }
+
+  function renderTable(container, data) {
+    container.innerHTML = '<h3 class="chart-title">Chart data</h3>';
+
+    var table = document.createElement('table');
+    table.className = 'data-table';
+
+    var thead = document.createElement('thead');
+    var headRow = document.createElement('tr');
+    ['Month', 'Revenue', 'Active users'].forEach(function (text, i) {
+      var th = document.createElement('th');
+      if (i > 0) th.className = 'numeric';
+      th.textContent = text;
+      headRow.appendChild(th);
+    });
+    thead.appendChild(headRow);
+    table.appendChild(thead);
+
+    var tbody = document.createElement('tbody');
+    data.forEach(function (row) {
+      var tr = document.createElement('tr');
+
+      var monthTd = document.createElement('td');
+      monthTd.textContent = row.month;
+      tr.appendChild(monthTd);
+
+      var revenueTd = document.createElement('td');
+      revenueTd.className = 'numeric';
+      revenueTd.textContent = formatCurrency(row.revenue);
+      tr.appendChild(revenueTd);
+
+      var usersTd = document.createElement('td');
+      usersTd.className = 'numeric';
+      usersTd.textContent = formatNumber(row.users);
+      tr.appendChild(usersTd);
+
+      tbody.appendChild(tr);
+    });
+    table.appendChild(tbody);
+
+    container.appendChild(table);
+  }
+
+  // ---- The custom element itself: same shape as frontendtips-menu.js ----
   class DashboardWidget extends HTMLElement {
     constructor() {
       super();
-      // Shadow DOM: styles and ids here can't leak out, and the host
-      // page's CSS can't accidentally break this component either.
+      // Shadow DOM: this component's styles and internal ids can never
+      // clash with the host page's — or with anything OutSystems (or any
+      // other framework) generates around it.
       this.attachShadow({ mode: 'open' });
-      this._tasks = initialTasks.map(function (t) { return Object.assign({}, t); });
-      this._query = '';
-      this._filter = 'All';
-      this._message = '';
-      this._built = false;
     }
 
-    static get observedAttributes() {
-      return ['heading'];
-    }
-
-    // Runs automatically the moment <dashboard-widget> is inserted into
-    // the page — this is the only "hook" this component needs.
+    // Runs the moment <dashboard-widget> is inserted into the page.
     connectedCallback() {
-      if (!this._built) {
-        this.buildShell();
-        this._built = true;
-      }
-      this.update();
+      this.render();
     }
 
-    attributeChangedCallback(name) {
-      if (name === 'heading' && this._built) {
-        var h2 = this.shadowRoot.querySelector('h2');
-        if (h2) h2.textContent = this.getAttribute('heading') || 'Operations dashboard';
-      }
-    }
-
-    // Builds the static shell once. Only the dynamic sub-elements
-    // (.ospoc-stats, the <ul>, and the message div) are rebuilt on every
-    // update() call — the search input and select stay untouched, so
-    // typing in the search box never loses focus.
-    buildShell() {
-      var self = this;
-      var heading = this.getAttribute('heading') || 'Operations dashboard';
-
+    render() {
+      // No page-level title/header here — the host screen already has its
+      // own heading. This just renders the two charts and the table below.
       this.shadowRoot.innerHTML =
         '<style>' + DashboardWidget.styles() + '</style>' +
-        '<section class="ospoc">' +
-        '<div class="ospoc-label">OUTSYSTEMS UI POC &middot; VERSION 1</div>' +
-        '<h2>' + escapeHtml(heading) + '</h2>' +
-        '<p>A custom UI loaded from a JavaScript file.</p>' +
-        '<div class="ospoc-stats"></div>' +
-        '<div class="ospoc-controls">' +
-        '<label>Search tasks<input type="search" placeholder="Search by task or owner"></label>' +
-        '<label>Status<select>' +
-        '<option>All</option><option>Open</option><option>Completed</option>' +
-        '</select></label>' +
+        '<div class="dashboard">' +
+        '<div class="charts-row">' +
+        '<div class="chart-card" id="revenue-chart"></div>' +
+        '<div class="chart-card" id="users-chart"></div>' +
         '</div>' +
-        '<ul class="ospoc-list" aria-label="Tasks"></ul>' +
-        '<div class="ospoc-message" role="status" aria-live="polite"></div>' +
-        '</section>';
+        '<div class="chart-card" id="data-table"></div>' +
+        '</div>';
 
-      var root = this.shadowRoot;
-
-      // Listeners live on the shadow root itself (event delegation), so
-      // they survive the targeted child updates done in update().
-      root.addEventListener('input', function (e) {
-        if (e.target.matches('input')) {
-          self._query = e.target.value;
-          self.update();
-        }
+      // Ids here are scoped to this shadow root, so they're safe even if
+      // the host page has its own "revenue-chart" id, or if there are
+      // multiple <dashboard-widget> instances on the same page.
+      renderBarChart(this.shadowRoot.getElementById('revenue-chart'), {
+        title: 'Monthly revenue',
+        data: dashboardData,
+        valueKey: 'revenue',
+        color: 'var(--series-1)',
+        formatValue: formatCurrency
       });
 
-      root.addEventListener('change', function (e) {
-        if (e.target.matches('select')) {
-          self._filter = e.target.value;
-          self.update();
-        }
+      renderLineChart(this.shadowRoot.getElementById('users-chart'), {
+        title: 'Monthly active users',
+        data: dashboardData,
+        valueKey: 'users',
+        color: 'var(--series-2)',
+        formatValue: formatNumber
       });
 
-      root.addEventListener('click', function (e) {
-        var button = e.target.closest('button[data-id]');
-        if (!button || button.disabled) return;
-
-        var task = self._tasks.find(function (t) { return t.id === Number(button.dataset.id); });
-        if (!task) return;
-
-        task.status = 'Completed';
-        self._message = task.title + ' completed.';
-        self.update();
-
-        // No function reference to pass in from the host page — OutSystems
-        // (or any host) just listens for this event instead.
-        self.dispatchEvent(new CustomEvent('os-task-complete', {
-          detail: { id: task.id, title: task.title },
-          bubbles: true,
-          composed: true
-        }));
-      });
+      renderTable(this.shadowRoot.getElementById('data-table'), dashboardData);
     }
 
-    update() {
-      var root = this.shadowRoot;
-      var tasks = this._tasks;
-
-      var stats = root.querySelector('.ospoc-stats');
-      stats.replaceChildren();
-      [
-        ['Total', tasks.length],
-        ['Open', tasks.filter(function (t) { return t.status === 'Open'; }).length],
-        ['Completed', tasks.filter(function (t) { return t.status === 'Completed'; }).length]
-      ].forEach(function (pair) {
-        var card = document.createElement('div');
-        card.className = 'ospoc-stat';
-        var value = document.createElement('strong');
-        value.textContent = pair[1];
-        card.append(value, document.createTextNode(pair[0]));
-        stats.append(card);
-      });
-
-      var list = root.querySelector('ul');
-      list.replaceChildren();
-      var query = this._query.toLowerCase();
-      var filter = this._filter;
-      var visible = tasks.filter(function (t) {
-        return (filter === 'All' || t.status === filter) &&
-          (t.title + ' ' + t.owner).toLowerCase().includes(query);
-      });
-
-      visible.forEach(function (t) {
-        var row = document.createElement('li');
-        var info = document.createElement('div');
-        var owner = document.createElement('small');
-        var button = document.createElement('button');
-
-        info.textContent = t.title;
-        owner.textContent = t.owner + ' \u00b7 ' + t.status;
-        info.append(owner);
-
-        button.type = 'button';
-        button.textContent = t.status === 'Completed' ? 'Completed' : 'Mark complete';
-        button.disabled = t.status === 'Completed';
-        button.dataset.id = String(t.id);
-
-        row.append(info, button);
-        list.append(row);
-      });
-
-      if (!visible.length) {
-        var empty = document.createElement('li');
-        empty.textContent = 'No matching tasks.';
-        list.append(empty);
-      }
-
-      root.querySelector('.ospoc-message').textContent = this._message;
-    }
-
-    // Matches the shipped OutSystems screen: no big outer card around the
-    // whole widget — the eyebrow/title/subtitle sit directly on the host
-    // page's background, and only the stat tiles, the inputs, and the
-    // task list each get their own white, bordered surface. Colors are
-    // exposed as custom properties so a host page can retheme without
-    // touching this file, e.g.:
-    //   <dashboard-widget style="--accent:#2a78d6"></dashboard-widget>
     static styles() {
       return (
         ':host {' +
         '  display: block;' +
         '  color-scheme: light;' +
-        '  --surface-1: #ffffff;' +
-        '  --text-primary: #11151c;' +
-        '  --text-secondary: #5b6472;' +
-        '  --text-muted: #7a8290;' +
-        '  --border: #e2e5ea;' +
-        '  --divider: #eef0f3;' +
-        '  --eyebrow: #0f7d70;' +
-        '  --accent: #0f7d70;' +
-        '  --accent-contrast: #ffffff;' +
-        '  --completed-bg: #eaf6f2;' +
-        '  --completed-text: #4b5b58;' +
-        '  font-family: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;' +
+        '  --page-plane: #f9f9f7;' +
+        '  --surface-1: #fcfcfb;' +
+        '  --text-primary: #0b0b0b;' +
+        '  --text-secondary: #52514e;' +
+        '  --text-muted: #898781;' +
+        '  --gridline: #e1e0d9;' +
+        '  --baseline: #c3c2b7;' +
+        '  --border: rgba(11, 11, 11, 0.1);' +
+        '  --series-1: #2a78d6;' +
+        '  --series-2: #eb6834;' +
+        '  font-family: system-ui, -apple-system, "Segoe UI", sans-serif;' +
         '}' +
         '@media (prefers-color-scheme: dark) {' +
         '  :host {' +
         '    color-scheme: dark;' +
-        '    --surface-1: #1c1f24;' +
-        '    --text-primary: #f2f3f5;' +
-        '    --text-secondary: #b7bec8;' +
-        '    --text-muted: #8b93a0;' +
-        '    --border: #33383f;' +
-        '    --divider: #2b2f35;' +
-        '    --eyebrow: #35b39f;' +
-        '    --accent: #35b39f;' +
-        '    --accent-contrast: #06110f;' +
-        '    --completed-bg: #223330;' +
-        '    --completed-text: #b7bec8;' +
+        '    --page-plane: #0d0d0d;' +
+        '    --surface-1: #1a1a19;' +
+        '    --text-primary: #ffffff;' +
+        '    --text-secondary: #c3c2b7;' +
+        '    --text-muted: #898781;' +
+        '    --gridline: #2c2c2a;' +
+        '    --baseline: #383835;' +
+        '    --border: rgba(255, 255, 255, 0.1);' +
+        '    --series-1: #3987e5;' +
+        '    --series-2: #d95926;' +
         '  }' +
         '}' +
         '* { box-sizing: border-box; }' +
-        '.ospoc { color: var(--text-primary); padding: 24px; }' +
-        '.ospoc-label { font-size: 11px; font-weight: 700; letter-spacing: 0.08em; text-transform: uppercase; color: var(--eyebrow); margin-bottom: 8px; }' +
-        '.ospoc h2 { margin: 0 0 6px; font-size: 26px; font-weight: 700; }' +
-        '.ospoc > p { margin: 0 0 24px; color: var(--text-secondary); font-size: 14px; }' +
-        '.ospoc-stats { display: flex; gap: 16px; margin-bottom: 24px; flex-wrap: wrap; }' +
-        '.ospoc-stat { display: flex; flex-direction: column; gap: 2px; background: var(--surface-1); border: 1px solid var(--border); border-radius: 10px; padding: 18px 22px; flex: 1 1 160px; }' +
-        '.ospoc-stat strong { font-size: 28px; font-weight: 700; color: var(--text-primary); line-height: 1.15; }' +
-        '.ospoc-stat { font-size: 14px; color: var(--text-secondary); }' +
-        '.ospoc-controls { display: flex; gap: 20px; flex-wrap: wrap; margin-bottom: 20px; }' +
-        '.ospoc-controls label { display: flex; flex-direction: column; gap: 6px; font-size: 13px; color: var(--text-secondary); flex: 1 1 220px; }' +
-        '.ospoc-controls input, .ospoc-controls select { font: inherit; font-size: 14px; padding: 10px 14px; border-radius: 8px; border: 1px solid var(--border); background: var(--surface-1); color: var(--text-primary); }' +
-        '.ospoc-controls input::placeholder { color: var(--text-muted); }' +
-        '.ospoc-list { list-style: none; margin: 0; padding: 0; border: 1px solid var(--border); border-radius: 10px; background: var(--surface-1); overflow: hidden; }' +
-        '.ospoc-list li { display: flex; align-items: center; justify-content: space-between; gap: 16px; padding: 18px 22px; border-bottom: 1px solid var(--divider); }' +
-        '.ospoc-list li:last-child { border-bottom: none; }' +
-        '.ospoc-list li > div { display: flex; flex-direction: column; gap: 2px; font-size: 15px; font-weight: 600; }' +
-        '.ospoc-list li small { color: var(--text-muted); font-size: 13px; font-weight: 400; }' +
-        'button { font: inherit; font-size: 14px; font-weight: 600; padding: 10px 18px; border-radius: 8px; border: none; background: var(--accent); color: var(--accent-contrast); cursor: pointer; white-space: nowrap; }' +
-        'button:not(:disabled):hover { filter: brightness(1.08); }' +
-        'button:disabled { cursor: default; background: var(--completed-bg); color: var(--completed-text); }' +
-        '.ospoc-message { min-height: 18px; margin-top: 14px; font-size: 13px; color: var(--text-secondary); }'
+        '.dashboard { background: var(--page-plane); color: var(--text-primary); padding: 32px; }' +
+        '.charts-row { display: flex; flex-wrap: wrap; gap: 20px; margin-bottom: 20px; }' +
+        '.chart-card { background: var(--surface-1); border: 1px solid var(--border); border-radius: 10px; padding: 20px; flex: 1 1 380px; }' +
+        '.chart-title { margin: 0 0 12px; font-size: 14px; font-weight: 600; color: var(--text-primary); }' +
+        '.chart-wrap { position: relative; }' +
+        '.chart-svg { width: 100%; height: auto; overflow: visible; display: block; }' +
+        '.gridline { stroke: var(--gridline); stroke-width: 1; }' +
+        '.baseline { stroke: var(--baseline); stroke-width: 1; }' +
+        '.crosshair { stroke: var(--baseline); stroke-width: 1; pointer-events: none; }' +
+        '.tick-label { fill: var(--text-muted); font-size: 10px; }' +
+        '.axis-label { fill: var(--text-muted); font-size: 11px; }' +
+        '.data-label { fill: var(--text-primary); font-size: 11px; font-weight: 600; }' +
+        '.chart-svg path.hit-target, .chart-svg circle.hit-target { cursor: pointer; outline: none; }' +
+        '.chart-svg path.hit-target:focus-visible, .chart-svg circle.hit-target:focus-visible { stroke: var(--text-primary); stroke-width: 2; }' +
+        '.chart-tooltip { position: absolute; transform: translate(-50%, -130%); background: var(--surface-1); border: 1px solid var(--border); border-radius: 6px; padding: 6px 10px; box-shadow: 0 2px 8px rgba(0,0,0,0.15); pointer-events: none; white-space: nowrap; }' +
+        '.chart-tooltip[hidden] { display: none; }' +
+        '.tooltip-value { font-size: 13px; font-weight: 700; color: var(--text-primary); }' +
+        '.tooltip-label { display: flex; align-items: center; gap: 6px; font-size: 11px; color: var(--text-secondary); margin-top: 2px; }' +
+        '.tooltip-swatch { width: 8px; height: 2px; border-radius: 1px; display: inline-block; }' +
+        '.data-table { width: 100%; border-collapse: collapse; font-size: 13px; }' +
+        '.data-table th { text-align: left; color: var(--text-secondary); font-weight: 600; padding: 8px 12px; border-bottom: 1px solid var(--baseline); }' +
+        '.data-table td { padding: 8px 12px; border-bottom: 1px solid var(--gridline); color: var(--text-primary); }' +
+        '.data-table th.numeric, .data-table td.numeric { text-align: right; font-variant-numeric: tabular-nums; }' +
+        '.data-table tbody tr:last-child td { border-bottom: none; }'
       );
     }
   }
