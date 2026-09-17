@@ -1,392 +1,297 @@
 /**
  * dashboard-widget.js
- **/
+ *
+ * Production version of the pasted "OutSystemsPOC.mount()" script, rebuilt
+ * in the same shape as frontendtips-menu.js / simple-spa-menu.js: a real
+ * custom element with its own Shadow DOM, registered once via
+ * customElements.define(). No document.getElementById() lookup on a
+ * container id anywhere in this file.
+ *
+ * NOTE ON THE TAG NAME: this registers as <dashboard-widget>, the same
+ * tag used by the project's other dashboard-widget.js example (the
+ * revenue/users charts component), per instruction to always reuse that
+ * tag name for this element rather than pick a new one per version. Both
+ * scripts call customElements.define(), guarded with
+ * `if (!customElements.get('dashboard-widget'))` — so if BOTH files are
+ * ever loaded on the same OutSystems screen (e.g. one in module Extra
+ * Scripts and one in a Theme), only whichever one's script tag executes
+ * first will actually register, and the other's define() call will be
+ * silently skipped. Make sure only one "dashboard-widget" file is active
+ * per app/theme at a time, or the wrong component will render.
+ *
+ * Why this matters for OutSystems: the original script exposed
+ * window.OutSystemsPOC.mount(containerId, options) and hunted for a fixed
+ * container id. OutSystems generates its own DOM ids at runtime (they
+ * change per render / per screen instance), so that lookup can silently
+ * fail to find its target, and the mount/unmount lifecycle had to be
+ * managed by hand. A custom element removes both problems: the browser
+ * calls connectedCallback() the moment <dashboard-widget> appears anywhere
+ * in the DOM, and disconnectedCallback() cleans up automatically when it's
+ * removed — no id, no manual mount()/unmount() bookkeeping.
+ *
+ * What changed vs. the original, and why:
+ *   1. Shadow DOM instead of a plain <section> appended to a host element,
+ *      so this component's ids/classes/CSS can never collide with the
+ *      OutSystems screen's own markup, and multiple instances on one
+ *      screen don't clash.
+ *   2. The shell (label, heading, description, search box, filter select)
+ *      is built once in connectedCallback(); only the stats/list/message
+ *      are rebuilt on state changes. This is what the original code
+ *      already did (render() only touched .ospoc-stats/ul/.ospoc-message)
+ *      — kept here so the search input never loses focus while typing.
+ *   3. The options.onComplete(id, title) callback is replaced with a
+ *      bubbling, shadow-crossing CustomEvent('task-completed'). This
+ *      decouples the component from OutSystems entirely — it works the
+ *      same whether or not anything is listening — and matches how
+ *      OutSystems JS nodes normally wire up to a widget: by listening on
+ *      the element itself, not by passing it a callback at construction
+ *      time.
+ *   4. Added ARIA labeling on the search box, filter select and per-row
+ *      buttons, an aria-live message region (kept from the original),
+ *      and focus-visible styling for keyboard users.
+ *   5. Added a small public API (getTasks / setTasks / markComplete) so
+ *      an OutSystems JS node can drive the component programmatically,
+ *      in addition to listening for its events.
+ *   6. customElements.define() is guarded against double-registration,
+ *      matching every other file in this project.
+ *
+ * Usage in OutSystems:
+ *   1. Upload this file as a resource and add it to the module's (or
+ *      Theme's) Extra Scripts, so customElements.define() runs once when
+ *      the app loads.
+ *   2. On any screen, drop an HTML widget and put this inside it:
+ *        <dashboard-widget heading="Operations dashboard"></dashboard-widget>
+ *      The `heading` attribute is optional and reactive.
+ *   3. To react to a completed task, add a JS node (e.g. on screen ready)
+ *      that does:
+ *        document.querySelector('dashboard-widget')
+ *          .addEventListener('task-completed', function (e) {
+ *            // e.detail.id, e.detail.title
+ *            // call an OutSystems client/server action here
+ *          });
+ *      If your handler determines the OutSystems-side action failed, call
+ *      e.preventDefault() inside it — the component will show an inline
+ *      error message when that happens.
+ *   4. IMPORTANT: keep the tag name "dashboard-widget" unchanged in future
+ *      versions of this file — the OutSystems screen that references it
+ *      is not republished when the script changes.
+ */
 (function () {
   'use strict';
 
-  var SVG_NS = 'http://www.w3.org/2000/svg';
-  var WIDTH = 480;
-  var HEIGHT = 260;
-  var PAD_LEFT = 52;
-  var PAD_TOP = 28;
-  var PAD_BOTTOM = 32;
+  var DEFAULT_HEADING = 'Operations dashboard';
+  var STATUSES = ['All', 'Open', 'Completed'];
 
-  // ---- Sample dataset, shared by both charts and the table ----
-  var dashboardData = [
-    { month: 'Jan', revenue: 12000, users: 320 },
-    { month: 'Feb', revenue: 15000, users: 410 },
-    { month: 'Mar', revenue: 13500, users: 380 },
-    { month: 'Apr', revenue: 18200, users: 460 },
-    { month: 'May', revenue: 20100, users: 510 },
-    { month: 'Jun', revenue: 22400, users: 590 },
-    { month: 'Jul', revenue: 24800, users: 640 },
-    { month: 'Aug', revenue: 23100, users: 610 },
-    { month: 'Sep', revenue: 26500, users: 670 },
-    { month: 'Oct', revenue: 28900, users: 720 },
-    { month: 'Nov', revenue: 31200, users: 760 },
-    { month: 'Dec', revenue: 34500, users: 810 }
+  var defaultTasks = [
+    { id: 1, title: 'Review warehouse layout', owner: 'Alex', status: 'Open' },
+    { id: 2, title: 'Approve maintenance request', owner: 'Sam', status: 'Open' },
+    { id: 3, title: 'Confirm delivery schedule', owner: 'Jordan', status: 'Completed' }
   ];
 
-  function formatCurrency(v) { return '$' + v.toLocaleString('en-US'); }
-  function formatNumber(v) { return v.toLocaleString('en-US'); }
-
-  function niceScale(maxValue, tickCount) {
-    tickCount = tickCount || 4;
-    if (maxValue <= 0) return { niceMax: 1, ticks: [0, 1] };
-
-    var rawStep = maxValue / tickCount;
-    var magnitude = Math.pow(10, Math.floor(Math.log10(rawStep)));
-    var normalized = rawStep / magnitude;
-
-    var niceStep;
-    if (normalized <= 1) niceStep = 1 * magnitude;
-    else if (normalized <= 2) niceStep = 2 * magnitude;
-    else if (normalized <= 5) niceStep = 5 * magnitude;
-    else niceStep = 10 * magnitude;
-
-    var niceMax = Math.ceil(maxValue / niceStep) * niceStep;
-    var ticks = [];
-    for (var t = 0; t <= niceMax; t += niceStep) ticks.push(Math.round(t));
-
-    return { niceMax: niceMax, ticks: ticks };
-  }
-
-  function svgEl(tag, attrs) {
-    var e = document.createElementNS(SVG_NS, tag);
-    for (var key in attrs) {
-      if (Object.prototype.hasOwnProperty.call(attrs, key)) {
-        e.setAttribute(key, attrs[key]);
-      }
-    }
-    return e;
-  }
-
-  // Top corners rounded, bottom square — bars grow from a single baseline.
-  function topRoundedRectPath(x, y, width, height, radius) {
-    var r = Math.max(0, Math.min(radius, width / 2, height));
-    var yBottom = y + height;
-    return (
-      'M' + x + ',' + (y + r) +
-      ' Q' + x + ',' + y + ' ' + (x + r) + ',' + y +
-      ' L' + (x + width - r) + ',' + y +
-      ' Q' + (x + width) + ',' + y + ' ' + (x + width) + ',' + (y + r) +
-      ' L' + (x + width) + ',' + yBottom +
-      ' L' + x + ',' + yBottom +
-      ' Z'
-    );
-  }
-
-  function renderTooltip(tooltip, xPercent, yPercent, value, month, color) {
-    tooltip.innerHTML = '';
-    var valueEl = document.createElement('div');
-    valueEl.className = 'tooltip-value';
-    valueEl.textContent = value;
-    var labelEl = document.createElement('div');
-    labelEl.className = 'tooltip-label';
-    var swatch = document.createElement('span');
-    swatch.className = 'tooltip-swatch';
-    swatch.style.backgroundColor = color;
-    labelEl.appendChild(swatch);
-    labelEl.appendChild(document.createTextNode(month));
-    tooltip.appendChild(valueEl);
-    tooltip.appendChild(labelEl);
-    tooltip.style.left = xPercent + '%';
-    tooltip.style.top = yPercent + '%';
-    tooltip.hidden = false;
-  }
-
-  // ---- Each render* function only ever touches the container element
-  // it's handed — no document.getElementById, no global ids — so they
-  // work the same whether that container lives in the light DOM or, as
-  // here, inside a component's Shadow DOM. ----
-
-  function renderBarChart(container, opts) {
-    var data = opts.data, valueKey = opts.valueKey, color = opts.color, formatValue = opts.formatValue;
-    var PAD_RIGHT = 16;
-    var plotW = WIDTH - PAD_LEFT - PAD_RIGHT;
-    var plotH = HEIGHT - PAD_TOP - PAD_BOTTOM;
-
-    var values = data.map(function (d) { return d[valueKey]; });
-    var maxValue = Math.max.apply(null, values);
-    var scale = niceScale(maxValue, 4);
-    var niceMax = scale.niceMax, ticks = scale.ticks;
-
-    var slotWidth = plotW / data.length;
-    var barWidth = Math.min(24, slotWidth * 0.5);
-    var maxIndex = values.indexOf(maxValue);
-
-    function yFor(value) { return PAD_TOP + plotH - (value / niceMax) * plotH; }
-
-    container.innerHTML =
-      '<h3 class="chart-title">' + opts.title + '</h3>' +
-      '<div class="chart-wrap">' +
-      '<svg viewBox="0 0 ' + WIDTH + ' ' + HEIGHT + '" class="chart-svg" role="img" aria-label="' + opts.title + '"></svg>' +
-      '<div class="chart-tooltip" hidden></div>' +
-      '</div>';
-
-    var svg = container.querySelector('svg');
-    var tooltip = container.querySelector('.chart-tooltip');
-
-    ticks.forEach(function (tick) {
-      var y = yFor(tick);
-      svg.appendChild(svgEl('line', { x1: PAD_LEFT, x2: WIDTH - PAD_RIGHT, y1: y, y2: y, class: 'gridline' }));
-      var text = svgEl('text', { x: PAD_LEFT - 8, y: y, class: 'tick-label', 'text-anchor': 'end', 'dominant-baseline': 'middle' });
-      text.textContent = tick.toLocaleString('en-US');
-      svg.appendChild(text);
-    });
-
-    svg.appendChild(svgEl('line', {
-      x1: PAD_LEFT, x2: WIDTH - PAD_RIGHT,
-      y1: PAD_TOP + plotH, y2: PAD_TOP + plotH, class: 'baseline'
-    }));
-
-    data.forEach(function (d, i) {
-      var value = d[valueKey];
-      var barHeight = (value / niceMax) * plotH;
-      var xCenter = PAD_LEFT + slotWidth * (i + 0.5);
-      var x = xCenter - barWidth / 2;
-      var y = PAD_TOP + plotH - barHeight;
-
-      var path = svgEl('path', {
-        d: topRoundedRectPath(x, y, barWidth, barHeight, 4),
-        fill: color,
-        opacity: '0.92',
-        tabindex: '0',
-        role: 'img',
-        'aria-label': d.month + ': ' + formatValue(value),
-        class: 'hit-target'
-      });
-      path.style.transition = 'filter 0.15s, opacity 0.15s';
-
-      function show() {
-        path.style.filter = 'brightness(1.1)';
-        path.setAttribute('opacity', '1');
-        renderTooltip(tooltip, (xCenter / WIDTH) * 100, (y / HEIGHT) * 100, formatValue(value), d.month, color);
-      }
-      function hide() {
-        path.style.filter = 'none';
-        path.setAttribute('opacity', '0.92');
-        tooltip.hidden = true;
-      }
-
-      path.addEventListener('mouseenter', show);
-      path.addEventListener('mouseleave', hide);
-      path.addEventListener('focus', show);
-      path.addEventListener('blur', hide);
-
-      svg.appendChild(path);
-
-      if (i === maxIndex) {
-        var label = svgEl('text', { x: xCenter, y: y - 8, 'text-anchor': 'middle', class: 'data-label' });
-        label.textContent = formatValue(value);
-        svg.appendChild(label);
-      }
-
-      var monthLabel = svgEl('text', { x: xCenter, y: HEIGHT - 10, 'text-anchor': 'middle', class: 'axis-label' });
-      monthLabel.textContent = d.month;
-      svg.appendChild(monthLabel);
-    });
-  }
-
-  function renderLineChart(container, opts) {
-    var data = opts.data, valueKey = opts.valueKey, color = opts.color, formatValue = opts.formatValue;
-    var PAD_RIGHT = 40;
-    var plotW = WIDTH - PAD_LEFT - PAD_RIGHT;
-    var plotH = HEIGHT - PAD_TOP - PAD_BOTTOM;
-
-    var values = data.map(function (d) { return d[valueKey]; });
-    var maxValue = Math.max.apply(null, values);
-    var scale = niceScale(maxValue, 4);
-    var niceMax = scale.niceMax, ticks = scale.ticks;
-
-    var slotWidth = plotW / data.length;
-    function xFor(i) { return PAD_LEFT + slotWidth * (i + 0.5); }
-    function yFor(value) { return PAD_TOP + plotH - (value / niceMax) * plotH; }
-
-    var points = data.map(function (d, i) { return { x: xFor(i), y: yFor(d[valueKey]) }; });
-    var linePath = points.map(function (p, i) { return (i === 0 ? 'M' : 'L') + p.x + ',' + p.y; }).join(' ');
-    var lastIndex = data.length - 1;
-
-    container.innerHTML =
-      '<h3 class="chart-title">' + opts.title + '</h3>' +
-      '<div class="chart-wrap">' +
-      '<svg viewBox="0 0 ' + WIDTH + ' ' + HEIGHT + '" class="chart-svg" role="img" aria-label="' + opts.title + '"></svg>' +
-      '<div class="chart-tooltip" hidden></div>' +
-      '</div>';
-
-    var svg = container.querySelector('svg');
-    var tooltip = container.querySelector('.chart-tooltip');
-
-    ticks.forEach(function (tick) {
-      var y = yFor(tick);
-      svg.appendChild(svgEl('line', { x1: PAD_LEFT, x2: WIDTH - PAD_RIGHT, y1: y, y2: y, class: 'gridline' }));
-      var text = svgEl('text', { x: PAD_LEFT - 8, y: y, class: 'tick-label', 'text-anchor': 'end', 'dominant-baseline': 'middle' });
-      text.textContent = tick.toLocaleString('en-US');
-      svg.appendChild(text);
-    });
-
-    svg.appendChild(svgEl('line', {
-      x1: PAD_LEFT, x2: WIDTH - PAD_RIGHT,
-      y1: PAD_TOP + plotH, y2: PAD_TOP + plotH, class: 'baseline'
-    }));
-
-    data.forEach(function (d, i) {
-      var monthLabel = svgEl('text', { x: xFor(i), y: HEIGHT - 10, 'text-anchor': 'middle', class: 'axis-label' });
-      monthLabel.textContent = d.month;
-      svg.appendChild(monthLabel);
-    });
-
-    svg.appendChild(svgEl('path', {
-      d: linePath, fill: 'none', stroke: color, 'stroke-width': '2',
-      'stroke-linejoin': 'round', 'stroke-linecap': 'round'
-    }));
-
-    var crosshair = svgEl('line', {
-      x1: 0, x2: 0, y1: PAD_TOP, y2: PAD_TOP + plotH, class: 'crosshair'
-    });
-    crosshair.style.display = 'none';
-    svg.appendChild(crosshair);
-
-    points.forEach(function (p, i) {
-      var circle = svgEl('circle', {
-        cx: p.x, cy: p.y, r: 4, fill: color,
-        stroke: 'var(--surface-1)', 'stroke-width': '2',
-        tabindex: '0', role: 'img',
-        'aria-label': data[i].month + ': ' + formatValue(data[i][valueKey]),
-        class: 'hit-target'
-      });
-      circle.addEventListener('focus', function () { setHover(i); });
-      circle.addEventListener('blur', function () { clearHover(); });
-      svg.appendChild(circle);
-    });
-
-    var endLabel = svgEl('text', {
-      x: points[lastIndex].x + 8, y: points[lastIndex].y - 8,
-      class: 'data-label', 'text-anchor': 'start'
-    });
-    endLabel.textContent = formatValue(data[lastIndex][valueKey]);
-    svg.appendChild(endLabel);
-
-    var overlay = svgEl('rect', {
-      x: PAD_LEFT, y: PAD_TOP, width: plotW, height: plotH, fill: 'transparent'
-    });
-    svg.appendChild(overlay);
-
-    function setHover(index) {
-      var p = points[index];
-      crosshair.setAttribute('x1', p.x);
-      crosshair.setAttribute('x2', p.x);
-      crosshair.style.display = 'block';
-      renderTooltip(tooltip, (p.x / WIDTH) * 100, (p.y / HEIGHT) * 100, formatValue(data[index][valueKey]), data[index].month, color);
-    }
-    function clearHover() {
-      crosshair.style.display = 'none';
-      tooltip.hidden = true;
-    }
-
-    overlay.addEventListener('mousemove', function (e) {
-      var rect = svg.getBoundingClientRect();
-      var relativeX = ((e.clientX - rect.left) / rect.width) * WIDTH;
-      var nearest = 0, nearestDist = Infinity;
-      points.forEach(function (p, i) {
-        var dist = Math.abs(p.x - relativeX);
-        if (dist < nearestDist) { nearestDist = dist; nearest = i; }
-      });
-      setHover(nearest);
-    });
-    overlay.addEventListener('mouseleave', clearHover);
-  }
-
-  function renderTable(container, data) {
-    container.innerHTML = '<h3 class="chart-title">Chart data</h3>';
-
-    var table = document.createElement('table');
-    table.className = 'data-table';
-
-    var thead = document.createElement('thead');
-    var headRow = document.createElement('tr');
-    ['Month', 'Revenue', 'Active users'].forEach(function (text, i) {
-      var th = document.createElement('th');
-      if (i > 0) th.className = 'numeric';
-      th.textContent = text;
-      headRow.appendChild(th);
-    });
-    thead.appendChild(headRow);
-    table.appendChild(thead);
-
-    var tbody = document.createElement('tbody');
-    data.forEach(function (row) {
-      var tr = document.createElement('tr');
-
-      var monthTd = document.createElement('td');
-      monthTd.textContent = row.month;
-      tr.appendChild(monthTd);
-
-      var revenueTd = document.createElement('td');
-      revenueTd.className = 'numeric';
-      revenueTd.textContent = formatCurrency(row.revenue);
-      tr.appendChild(revenueTd);
-
-      var usersTd = document.createElement('td');
-      usersTd.className = 'numeric';
-      usersTd.textContent = formatNumber(row.users);
-      tr.appendChild(usersTd);
-
-      tbody.appendChild(tr);
-    });
-    table.appendChild(tbody);
-
-    container.appendChild(table);
-  }
-
-  // ---- The custom element itself: same shape as frontendtips-menu.js ----
-  class DashboardWidget extends HTMLElement {
+  class OpsTaskTracker extends HTMLElement {
     constructor() {
       super();
-      // Shadow DOM: this component's styles and internal ids can never
-      // clash with the host page's — or with anything OutSystems (or any
-      // other framework) generates around it.
+      // Shadow DOM: this component's markup, styles and internal ids can
+      // never clash with the host page's, or with anything OutSystems
+      // generates around it — and multiple instances stay independent.
       this.attachShadow({ mode: 'open' });
+
+      this._tasks = defaultTasks.map(function (t) { return Object.assign({}, t); });
+      this._query = '';
+      this._filter = 'All';
+      this._message = '';
+      this._built = false;
+
+      // Bind once so add/removeEventListener reference the same function.
+      this._onInput = this._onInput.bind(this);
+      this._onChange = this._onChange.bind(this);
+      this._onClick = this._onClick.bind(this);
+    }
+
+    static get observedAttributes() {
+      return ['heading'];
     }
 
     // Runs the moment <dashboard-widget> is inserted into the page.
     connectedCallback() {
-      this.render();
+      if (!this._built) {
+        this.buildShell();
+        this._built = true;
+      }
+      this.renderList();
     }
 
-    render() {
-      // No page-level title/header here — the host screen already has its
-      // own heading. This just renders the two charts and the table below.
+    // Runs automatically if the element is ever removed — no manual
+    // unmount() call needed, unlike the original mount/unmount API.
+    disconnectedCallback() {
+      this.shadowRoot.removeEventListener('input', this._onInput);
+      this.shadowRoot.removeEventListener('change', this._onChange);
+      this.shadowRoot.removeEventListener('click', this._onClick);
+    }
+
+    attributeChangedCallback(name, oldValue, newValue) {
+      if (name === 'heading' && this._built) {
+        var h = this.shadowRoot.querySelector('.ospoc-heading');
+        if (h) h.textContent = newValue || DEFAULT_HEADING;
+      }
+    }
+
+    // ---- Public API, for an OutSystems JS node holding a reference to
+    // this element (e.g. via document.querySelector('dashboard-widget')). ----
+
+    getTasks() {
+      return this._tasks.map(function (t) { return Object.assign({}, t); });
+    }
+
+    setTasks(tasks) {
+      if (!Array.isArray(tasks)) return;
+      this._tasks = tasks.map(function (t) { return Object.assign({}, t); });
+      this._message = '';
+      if (this._built) this.renderList();
+    }
+
+    markComplete(id) {
+      var task = this._tasks.find(function (t) { return t.id === id; });
+      if (!task || task.status === 'Completed') return;
+      task.status = 'Completed';
+      this._message = task.title + ' completed.';
+      this.renderList();
+      this._notifyComplete(task);
+    }
+
+    // ---- Shell: built once. Re-rendering only the parts below it keeps
+    // the search input and select focused/usable while the user types. ----
+    buildShell() {
+      var heading = this.getAttribute('heading') || DEFAULT_HEADING;
+
       this.shadowRoot.innerHTML =
-        '<style>' + DashboardWidget.styles() + '</style>' +
-        '<div class="dashboard">' +
-        '<div class="charts-row">' +
-        '<div class="chart-card" id="revenue-chart"></div>' +
-        '<div class="chart-card" id="users-chart"></div>' +
+        '<style>' + OpsTaskTracker.styles() + '</style>' +
+        '<section class="ospoc">' +
+        '<div class="ospoc-label">OUTSYSTEMS UI POC &middot; VERSION 1</div>' +
+        '<h2 class="ospoc-heading"></h2>' +
+        '<p class="ospoc-description">A custom UI loaded from a JavaScript file.</p>' +
+        '<div class="ospoc-stats" role="list"></div>' +
+        '<div class="ospoc-controls">' +
+        '<label>Search tasks<input type="search" placeholder="Search by task or owner" aria-label="Search tasks"></label>' +
+        '<label>Status<select aria-label="Filter by status">' +
+        STATUSES.map(function (s) { return '<option value="' + s + '">' + s + '</option>'; }).join('') +
+        '</select></label>' +
         '</div>' +
-        '<div class="chart-card" id="data-table"></div>' +
-        '</div>';
+        '<ul class="ospoc-list" aria-label="Tasks"></ul>' +
+        '<div class="ospoc-message" role="status" aria-live="polite"></div>' +
+        '</section>';
 
-      // Ids here are scoped to this shadow root, so they're safe even if
-      // the host page has its own "revenue-chart" id, or if there are
-      // multiple <dashboard-widget> instances on the same page.
-      renderBarChart(this.shadowRoot.getElementById('revenue-chart'), {
-        title: 'Monthly revenue',
-        data: dashboardData,
-        valueKey: 'revenue',
-        color: 'var(--series-1)',
-        formatValue: formatCurrency
+      this.shadowRoot.querySelector('.ospoc-heading').textContent = heading;
+
+      this.shadowRoot.addEventListener('input', this._onInput);
+      this.shadowRoot.addEventListener('change', this._onChange);
+      this.shadowRoot.addEventListener('click', this._onClick);
+    }
+
+    // ---- Stats/list/message rendering. Runs on every state change. Never
+    // touches the input/select elements themselves. ----
+    renderList() {
+      var root = this.shadowRoot;
+
+      var stats = root.querySelector('.ospoc-stats');
+      stats.replaceChildren();
+      [
+        ['Total', this._tasks.length],
+        ['Open', this._tasks.filter(function (t) { return t.status === 'Open'; }).length],
+        ['Completed', this._tasks.filter(function (t) { return t.status === 'Completed'; }).length]
+      ].forEach(function (pair) {
+        var card = document.createElement('div');
+        card.className = 'ospoc-stat';
+        card.setAttribute('role', 'listitem');
+        var value = document.createElement('strong');
+        value.textContent = pair[1];
+        card.append(value, document.createTextNode(pair[0]));
+        stats.append(card);
       });
 
-      renderLineChart(this.shadowRoot.getElementById('users-chart'), {
-        title: 'Monthly active users',
-        data: dashboardData,
-        valueKey: 'users',
-        color: 'var(--series-2)',
-        formatValue: formatNumber
+      var list = root.querySelector('.ospoc-list');
+      list.replaceChildren();
+      var query = this._query.toLowerCase();
+      var visible = this._tasks.filter(function (t) {
+        return (this._filter === 'All' || t.status === this._filter) &&
+          (t.title + ' ' + t.owner).toLowerCase().indexOf(query) !== -1;
+      }, this);
+
+      visible.forEach(function (t) {
+        var row = document.createElement('li');
+        var info = document.createElement('div');
+        var owner = document.createElement('small');
+        var button = document.createElement('button');
+
+        info.textContent = t.title;
+        owner.textContent = t.owner + ' \u00b7 ' + t.status;
+        info.append(owner);
+
+        button.type = 'button';
+        button.textContent = t.status === 'Completed' ? 'Completed' : 'Mark complete';
+        button.disabled = t.status === 'Completed';
+        button.dataset.id = String(t.id);
+        button.setAttribute(
+          'aria-label',
+          (t.status === 'Completed' ? 'Completed: ' : 'Mark complete: ') + t.title
+        );
+
+        row.append(info, button);
+        list.append(row);
       });
 
-      renderTable(this.shadowRoot.getElementById('data-table'), dashboardData);
+      if (!visible.length) {
+        var empty = document.createElement('li');
+        empty.className = 'ospoc-empty';
+        empty.textContent = 'No matching tasks.';
+        list.append(empty);
+      }
+
+      root.querySelector('.ospoc-message').textContent = this._message;
+    }
+
+    _onInput(e) {
+      if (e.target.matches('input')) {
+        this._query = e.target.value;
+        this.renderList();
+      }
+    }
+
+    _onChange(e) {
+      if (e.target.matches('select')) {
+        this._filter = e.target.value;
+        this.renderList();
+      }
+    }
+
+    _onClick(e) {
+      var button = e.target.closest('button[data-id]');
+      if (!button || button.disabled) return;
+      var id = Number(button.dataset.id);
+      var task = this._tasks.find(function (t) { return t.id === id; });
+      if (!task) return;
+      task.status = 'Completed';
+      this._message = task.title + ' completed.';
+      this.renderList();
+      this._notifyComplete(task);
+    }
+
+    // Fires a bubbling, shadow-crossing CustomEvent so the OutSystems
+    // screen can react without this component knowing anything about
+    // OutSystems. Cancelable: a listener can call e.preventDefault() to
+    // signal that the server-side action failed, which shows an inline
+    // error message here (replacing the old options.onComplete().catch()).
+    _notifyComplete(task) {
+      var proceeded = this.dispatchEvent(new CustomEvent('task-completed', {
+        detail: { id: task.id, title: task.title },
+        bubbles: true,
+        composed: true,
+        cancelable: true
+      }));
+      if (!proceeded) {
+        this._message = 'UI updated, but the OutSystems action failed.';
+        this.renderList();
+      }
     }
 
     static styles() {
@@ -399,11 +304,10 @@
         '  --text-primary: #0b0b0b;' +
         '  --text-secondary: #52514e;' +
         '  --text-muted: #898781;' +
-        '  --gridline: #e1e0d9;' +
-        '  --baseline: #c3c2b7;' +
-        '  --border: rgba(11, 11, 11, 0.1);' +
-        '  --series-1: #2a78d6;' +
-        '  --series-2: #eb6834;' +
+        '  --border: rgba(11, 11, 11, 0.12);' +
+        '  --accent: #2a78d6;' +
+        '  --accent-contrast: #ffffff;' +
+        '  --danger: #b3261e;' +
         '  font-family: system-ui, -apple-system, "Segoe UI", sans-serif;' +
         '}' +
         '@media (prefers-color-scheme: dark) {' +
@@ -414,43 +318,38 @@
         '    --text-primary: #ffffff;' +
         '    --text-secondary: #c3c2b7;' +
         '    --text-muted: #898781;' +
-        '    --gridline: #2c2c2a;' +
-        '    --baseline: #383835;' +
-        '    --border: rgba(255, 255, 255, 0.1);' +
-        '    --series-1: #3987e5;' +
-        '    --series-2: #d95926;' +
+        '    --border: rgba(255, 255, 255, 0.12);' +
+        '    --accent: #3987e5;' +
+        '    --danger: #e5847d;' +
         '  }' +
         '}' +
         '* { box-sizing: border-box; }' +
-        '.dashboard { background: var(--page-plane); color: var(--text-primary); padding: 32px; }' +
-        '.charts-row { display: flex; flex-wrap: wrap; gap: 20px; margin-bottom: 20px; }' +
-        '.chart-card { background: var(--surface-1); border: 1px solid var(--border); border-radius: 10px; padding: 20px; flex: 1 1 380px; }' +
-        '.chart-title { margin: 0 0 12px; font-size: 14px; font-weight: 600; color: var(--text-primary); }' +
-        '.chart-wrap { position: relative; }' +
-        '.chart-svg { width: 100%; height: auto; overflow: visible; display: block; }' +
-        '.gridline { stroke: var(--gridline); stroke-width: 1; }' +
-        '.baseline { stroke: var(--baseline); stroke-width: 1; }' +
-        '.crosshair { stroke: var(--baseline); stroke-width: 1; pointer-events: none; }' +
-        '.tick-label { fill: var(--text-muted); font-size: 10px; }' +
-        '.axis-label { fill: var(--text-muted); font-size: 11px; }' +
-        '.data-label { fill: var(--text-primary); font-size: 11px; font-weight: 600; }' +
-        '.chart-svg path.hit-target, .chart-svg circle.hit-target { cursor: pointer; outline: none; }' +
-        '.chart-svg path.hit-target:focus-visible, .chart-svg circle.hit-target:focus-visible { stroke: var(--text-primary); stroke-width: 2; }' +
-        '.chart-tooltip { position: absolute; transform: translate(-50%, -130%); background: var(--surface-1); border: 1px solid var(--border); border-radius: 6px; padding: 6px 10px; box-shadow: 0 2px 8px rgba(0,0,0,0.15); pointer-events: none; white-space: nowrap; }' +
-        '.chart-tooltip[hidden] { display: none; }' +
-        '.tooltip-value { font-size: 13px; font-weight: 700; color: var(--text-primary); }' +
-        '.tooltip-label { display: flex; align-items: center; gap: 6px; font-size: 11px; color: var(--text-secondary); margin-top: 2px; }' +
-        '.tooltip-swatch { width: 8px; height: 2px; border-radius: 1px; display: inline-block; }' +
-        '.data-table { width: 100%; border-collapse: collapse; font-size: 13px; }' +
-        '.data-table th { text-align: left; color: var(--text-secondary); font-weight: 600; padding: 8px 12px; border-bottom: 1px solid var(--baseline); }' +
-        '.data-table td { padding: 8px 12px; border-bottom: 1px solid var(--gridline); color: var(--text-primary); }' +
-        '.data-table th.numeric, .data-table td.numeric { text-align: right; font-variant-numeric: tabular-nums; }' +
-        '.data-table tbody tr:last-child td { border-bottom: none; }'
+        '.ospoc { background: var(--page-plane); color: var(--text-primary); padding: 24px; border-radius: 10px; max-width: 640px; }' +
+        '.ospoc-label { font-size: 11px; font-weight: 700; letter-spacing: 0.06em; color: var(--text-muted); margin-bottom: 8px; }' +
+        '.ospoc-heading { margin: 0 0 4px; font-size: 20px; font-weight: 700; }' +
+        '.ospoc-description { margin: 0 0 20px; font-size: 13px; color: var(--text-secondary); }' +
+        '.ospoc-stats { display: flex; gap: 12px; margin-bottom: 20px; flex-wrap: wrap; }' +
+        '.ospoc-stat { flex: 1 1 100px; background: var(--surface-1); border: 1px solid var(--border); border-radius: 8px; padding: 12px 14px; display: flex; flex-direction: column; gap: 2px; font-size: 12px; color: var(--text-secondary); }' +
+        '.ospoc-stat strong { font-size: 20px; color: var(--text-primary); }' +
+        '.ospoc-controls { display: flex; gap: 16px; flex-wrap: wrap; margin-bottom: 16px; }' +
+        '.ospoc-controls label { display: flex; flex-direction: column; gap: 4px; font-size: 12px; color: var(--text-secondary); flex: 1 1 180px; }' +
+        '.ospoc-controls input, .ospoc-controls select { font: inherit; font-size: 14px; padding: 8px 10px; border-radius: 6px; border: 1px solid var(--border); background: var(--surface-1); color: var(--text-primary); }' +
+        '.ospoc-controls input:focus-visible, .ospoc-controls select:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }' +
+        '.ospoc-list { list-style: none; margin: 0 0 12px; padding: 0; display: flex; flex-direction: column; gap: 8px; }' +
+        '.ospoc-list li { display: flex; align-items: center; justify-content: space-between; gap: 12px; background: var(--surface-1); border: 1px solid var(--border); border-radius: 8px; padding: 10px 14px; }' +
+        '.ospoc-list li.ospoc-empty { justify-content: center; color: var(--text-muted); font-size: 13px; }' +
+        '.ospoc-list small { display: block; color: var(--text-muted); font-size: 12px; margin-top: 2px; }' +
+        '.ospoc-list button { font: inherit; font-size: 13px; font-weight: 600; padding: 6px 12px; border-radius: 6px; border: 1px solid var(--accent); background: var(--accent); color: var(--accent-contrast); cursor: pointer; white-space: nowrap; }' +
+        '.ospoc-list button:disabled { background: transparent; color: var(--text-muted); border-color: var(--border); cursor: default; }' +
+        '.ospoc-list button:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }' +
+        '.ospoc-list button:not(:disabled):hover { filter: brightness(1.08); }' +
+        '.ospoc-message { min-height: 18px; font-size: 12px; color: var(--text-secondary); }' +
+        '.ospoc-message:not(:empty)::before { content: "\u2713 "; color: var(--accent); }'
       );
     }
   }
 
   if (!customElements.get('dashboard-widget')) {
-    customElements.define('dashboard-widget', DashboardWidget);
+    customElements.define('dashboard-widget', OpsTaskTracker);
   }
 })();
