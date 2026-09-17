@@ -262,7 +262,7 @@
         '  }' +
         '}' +
         '* { box-sizing: border-box; }' +
-        '.ospoc { color: var(--text-primary); }' +
+        '.ospoc { color: var(--text-primary); padding: 24px; }' +
         '.ospoc-label { font-size: 11px; font-weight: 700; letter-spacing: 0.08em; text-transform: uppercase; color: var(--eyebrow); margin-bottom: 8px; }' +
         '.ospoc h2 { margin: 0 0 6px; font-size: 26px; font-weight: 700; }' +
         '.ospoc > p { margin: 0 0 24px; color: var(--text-secondary); font-size: 14px; }' +
